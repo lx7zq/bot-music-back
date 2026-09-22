@@ -25,6 +25,18 @@ state: dict = defaultdict(lambda: {
 clients: list[WebSocket] = []
 pending_commands: dict = {}   # guild_id → {command, ...extra}
 
+# bot.py (_handle_dashboard_cmd) รู้จักแค่
+# skip|pause|resume|stop|restart|volume|add_song|remove_song
+# 'prev' จากปุ่ม ⏮ ในเว็บ → แปลงเป็น 'restart' (เล่นเพลงปัจจุบันใหม่)
+ACTION_ALIASES = {"prev": "restart"}
+
+
+def _store_command(guild_id: str, action: str, data: dict) -> dict:
+    command = ACTION_ALIASES.get(action, action)
+    entry = {"command": command, **{k: v for k, v in data.items() if k != "command"}}
+    pending_commands[guild_id] = entry
+    return entry
+
 
 async def broadcast(data: dict):
     dead = []
@@ -49,7 +61,7 @@ async def websocket_endpoint(websocket: WebSocket):
             guild_id = data.get("guild_id")
             action = data.get("action")
             # เก็บ command พร้อม extra data (เช่น value ของ volume)
-            pending_commands[guild_id] = {"command": action, **data}
+            _store_command(guild_id, action, data)
             if action == "volume":
                 state[guild_id]["volume"] = data.get("value", 50)
                 await broadcast({"type": "state_update", "guild_id": guild_id, "state": dict(state[guild_id])})
@@ -76,6 +88,20 @@ async def poll(guild_id: str):
     if entry is None:
         return {"command": None}
     return entry   # { command, guild_id, value?, query?, index? }
+
+
+# ── Dashboard → Bot (control commands via HTTP fallback) ─────────────────
+# frontend ยิงมาที่นี่ถ้า WS ไม่พร้อม (Render sleep / env scheme ผิด / firewall)
+@app.post("/command")
+async def command(request: Request):
+    data = await request.json()
+    guild_id = str(data.get("guild_id"))
+    action = data.get("action") or data.get("command", "")
+    entry = _store_command(guild_id, action, data)
+    if entry["command"] == "volume":
+        state[guild_id]["volume"] = data.get("value", 50)
+        await broadcast({"type": "state_update", "guild_id": guild_id, "state": dict(state[guild_id])})
+    return {"ok": True}
 
 
 # ── Dashboard → Bot (add/remove song) ─────────────────────────────────────
