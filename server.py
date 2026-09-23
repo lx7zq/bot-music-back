@@ -351,6 +351,20 @@ async def billing_status(guild_id: str):
     return {"guild_id": guild_id, **st}
 
 
+@app.get("/billing/pending/{pending_id}")
+async def billing_pending_status(pending_id: str):
+    """หน้าเว็บ poll ใบนี้หลังส่งสลิป — รู้เองว่า approve/reject แล้วโดยไม่ต้องกดรีเฟรช"""
+    p = pending_slips.get(pending_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="not found")
+    return {
+        "pending_id": pending_id,
+        "status": p["status"],
+        "guild_id": p["guild_id"],
+        "paid_until": subs.get(p["guild_id"], {}).get("paid_until"),
+    }
+
+
 @app.get("/billing/config")
 async def billing_config():
     """ราคา+พร้อมเพย์ให้หน้า /pricing (ไม่ hardcode ลง repo frontend)"""
