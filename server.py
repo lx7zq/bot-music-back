@@ -363,6 +363,15 @@ async def billing_config():
     }
 
 
+@app.get("/public/stats")
+async def public_stats():
+    """สถิติสาธารณะโชว์หน้า landing (นับเฉพาะดิสที่บอทเคยเห็น)"""
+    guilds = len(state)
+    playing = sum(1 for s in state.values() if s.get("is_playing"))
+    queued = sum(len(s.get("queue", [])) for s in state.values())
+    return {"guilds": guilds, "playing": playing, "queued": queued}
+
+
 @app.post("/billing/submit")
 async def billing_submit(guild_id: str, guild_name: str = "", slip: UploadFile = File(...)):
     """ลูกค้าอัปโหลดสลิป — ตรวจมือ: เก็บไฟล์ + ลง pending ให้เจ้าของกดในดิส"""
