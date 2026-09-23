@@ -163,6 +163,7 @@ async def websocket_endpoint(websocket: WebSocket):
 async def update(request: Request):
     data = await request.json()
     guild_id = str(data.get("guild_id"))
+    _touch_guild(guild_id)  # กันเหนียวอีกชั้น (หลักอยู่ที่ /poll)
     s = state[guild_id]
     s.update({k: v for k, v in data.items() if k != "guild_id"})
     await broadcast({"type": "state_update", "guild_id": guild_id, "state": dict(s)}, guild_id=guild_id)
@@ -171,7 +172,8 @@ async def update(request: Request):
 
 @app.get("/poll/{guild_id}")
 async def poll(guild_id: str):
-    """bot.py poll มาที่นี่ทุก 1 วินาที"""
+    """bot.py poll มาที่นี่ทุก 1 วินาที — ประทับ first_seen ดิสใหม่ตรงนี้ (~1วิหลังเชิญบอท)"""
+    _touch_guild(guild_id)
     entry = pending_commands.pop(guild_id, None)
     if entry is None:
         return {"command": None}
@@ -224,6 +226,7 @@ SLIPS_DIR = os.environ.get(
 )
 PLAN_DAYS = int(os.environ.get("PLAN_DAYS", "30") or 30)
 GRACE_DAYS = int(os.environ.get("BILLING_GRACE_DAYS", "3") or 3)
+TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "30") or 0)  # 0 = ปิด trial ขายตรง
 PLAN_PRICE = float(os.environ.get("PLAN_PRICE", "99") or 99)
 PROMPTPAY_ID = os.environ.get("PROMPTPAY_ID", "")
 os.makedirs(SLIPS_DIR, exist_ok=True)
@@ -254,22 +257,64 @@ def _today() -> date:
     return date.today()
 
 
+def _touch_guild(guild_id: str) -> None:
+    """ประทับ first_seen ครั้งแรกที่เห็นดิสนี้ — เตะออกแล้วเชิญใหม่ไม่รี (กันปั๊ม trial)"""
+    if not guild_id:
+        return
+    entry = subs.get(guild_id)
+    if entry is None:
+        subs[guild_id] = {"first_seen": _today().isoformat(), "history": []}
+        _save_subs(subs)
+    elif not entry.get("first_seen"):
+        entry["first_seen"] = _today().isoformat()
+        _save_subs(subs)
+
+
+def _trial_left(entry: dict) -> int:
+    if TRIAL_DAYS <= 0:
+        return 0
+    first = entry.get("first_seen")
+    if not first:
+        return TRIAL_DAYS
+    try:
+        left = TRIAL_DAYS - (_today() - date.fromisoformat(first)).days
+    except ValueError:
+        return 0
+    return max(0, left)
+
+
 def sub_status(guild_id: str) -> dict:
-    """จ่ายอยู่ไหม — นับ grace ให้อัตโนมัติ"""
+    """จ่ายอยู่ไหม — นับ grace + trial ให้อัตโนมัติ"""
     entry = subs.get(guild_id, {})
     paid_until = entry.get("paid_until")
-    if not paid_until:
-        return {"paid": False, "paid_until": None, "in_grace": False}
-    try:
-        until = date.fromisoformat(paid_until)
-    except ValueError:
-        return {"paid": False, "paid_until": paid_until, "in_grace": False}
-    today = _today()
-    if today <= until:
-        return {"paid": True, "paid_until": paid_until, "in_grace": False}
-    if today <= until + timedelta(days=GRACE_DAYS):
-        return {"paid": False, "paid_until": paid_until, "in_grace": True}
-    return {"paid": False, "paid_until": paid_until, "in_grace": False}
+    if paid_until:
+        try:
+            until = date.fromisoformat(paid_until)
+        except ValueError:
+            until = None
+        if until:
+            today = _today()
+            if today <= until:
+                return {"paid": True, "paid_until": paid_until, "in_grace": False,
+                        "trial": False, "trial_left": 0, "trial_expired": False}
+            if today <= until + timedelta(days=GRACE_DAYS):
+                return {"paid": False, "paid_until": paid_until, "in_grace": True,
+                        "trial": False, "trial_left": 0, "trial_expired": False}
+            return {"paid": False, "paid_until": paid_until, "in_grace": False,
+                    "trial": False, "trial_left": 0, "trial_expired": False}
+    left = _trial_left(entry)
+    if left > 0:
+        return {"paid": False, "paid_until": None, "in_grace": False,
+                "trial": True, "trial_left": left, "trial_expired": False}
+    if TRIAL_DAYS > 0 and entry.get("first_seen"):
+        return {"paid": False, "paid_until": None, "in_grace": False,
+                "trial": False, "trial_left": 0, "trial_expired": True}
+    return {"paid": False, "paid_until": None, "in_grace": False,
+            "trial": False, "trial_left": 0, "trial_expired": False}
+
+
+def _sub_ok(st: dict) -> bool:
+    return bool(st["paid"] or st["in_grace"] or st["trial"])
 
 
 def extend_subscription(guild_id: str, days: int = PLAN_DAYS) -> str:
@@ -296,8 +341,8 @@ async def verify_slip(_image_bytes: bytes) -> dict:
 async def internal_subscription(guild_id: str, x_bot_secret: str | None = Header(default=None)):
     _check_bot_secret(x_bot_secret)
     st = sub_status(guild_id)
-    # grace = ยังเล่นได้ (บอทนับ in_grace เป็นผ่าน)
-    return {"guild_id": guild_id, **st, "ok": st["paid"] or st["in_grace"]}
+    # grace + trial = ยังเล่นได้ (บอทนับ ok เป็นผ่าน)
+    return {"guild_id": guild_id, **st, "ok": _sub_ok(st)}
 
 
 @app.get("/billing/status/{guild_id}")
@@ -313,6 +358,7 @@ async def billing_config():
         "price": PLAN_PRICE,
         "plan_days": PLAN_DAYS,
         "grace_days": GRACE_DAYS,
+        "trial_days": TRIAL_DAYS,
         "promptpay_id": PROMPTPAY_ID,
     }
 
@@ -410,8 +456,10 @@ async def capability(guild_id: str, key: str = ""):
     return {
         "guild_id": guild_id,
         "can_control": check_key(guild_id, key),
-        "sub_ok": st["paid"] or st["in_grace"],
+        "sub_ok": _sub_ok(st),
         "paid_until": st["paid_until"],
+        "trial": st["trial"],
+        "trial_left": st["trial_left"],
     }
 
 
