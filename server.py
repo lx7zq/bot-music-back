@@ -1,11 +1,14 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException, Header
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException, Header, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 import asyncio
 import hmac
 import json
 import os
 import secrets
+import time
+import uuid
 from collections import defaultdict
+from datetime import date, timedelta
 
 app = FastAPI()
 
@@ -208,11 +211,208 @@ async def remove_song(request: Request):
     return {"ok": True}
 
 
+# ── Billing: subscriptions (99฿/ดิส/30วัน) ─────────────────────────────────
+# semi-manual: ลูกค้าส่งสลิป → ค้างใน pending → เจ้าของกด ✅/❌ ในดิส
+# ช่อง verify_slip() เตรียมไว้เสียบ SlipOK ทีหลัง (ตอนนี้ตรวจมือ 100%)
+SUBS_FILE = os.environ.get(
+    "SUBSCRIPTIONS_FILE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "subscriptions.json"),
+)
+SLIPS_DIR = os.environ.get(
+    "SLIPS_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "slips"),
+)
+PLAN_DAYS = int(os.environ.get("PLAN_DAYS", "30") or 30)
+GRACE_DAYS = int(os.environ.get("BILLING_GRACE_DAYS", "3") or 3)
+PLAN_PRICE = float(os.environ.get("PLAN_PRICE", "99") or 99)
+PROMPTPAY_ID = os.environ.get("PROMPTPAY_ID", "")
+os.makedirs(SLIPS_DIR, exist_ok=True)
+
+
+def _load_subs() -> dict:
+    try:
+        with open(SUBS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return dict(data) if isinstance(data, dict) else {}
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def _save_subs(subs: dict) -> None:
+    tmp = SUBS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(subs, f)
+    os.replace(tmp, SUBS_FILE)
+
+
+subs: dict = _load_subs()
+# pending_id → {pending_id, guild_id, guild_name, filename, status, created_at, notified}
+pending_slips: dict = {}
+
+
+def _today() -> date:
+    return date.today()
+
+
+def sub_status(guild_id: str) -> dict:
+    """จ่ายอยู่ไหม — นับ grace ให้อัตโนมัติ"""
+    entry = subs.get(guild_id, {})
+    paid_until = entry.get("paid_until")
+    if not paid_until:
+        return {"paid": False, "paid_until": None, "in_grace": False}
+    try:
+        until = date.fromisoformat(paid_until)
+    except ValueError:
+        return {"paid": False, "paid_until": paid_until, "in_grace": False}
+    today = _today()
+    if today <= until:
+        return {"paid": True, "paid_until": paid_until, "in_grace": False}
+    if today <= until + timedelta(days=GRACE_DAYS):
+        return {"paid": False, "paid_until": paid_until, "in_grace": True}
+    return {"paid": False, "paid_until": paid_until, "in_grace": False}
+
+
+def extend_subscription(guild_id: str, days: int = PLAN_DAYS) -> str:
+    """ต่ออายุ — เริ่มนับจากวันหมดของเดิมถ้ายังไม่หมด (ไม่โกงลูกค้า)"""
+    entry = subs.get(guild_id, {})
+    try:
+        base = max(_today(), date.fromisoformat(entry.get("paid_until", "2000-01-01")))
+    except ValueError:
+        base = _today()
+    new_until = (base + timedelta(days=days)).isoformat()
+    hist = entry.get("history", [])
+    hist.append({"date": _today().isoformat(), "days": days, "until": new_until})
+    subs[guild_id] = {"paid_until": new_until, "history": hist[-20:]}
+    _save_subs(subs)
+    return new_until
+
+
+async def verify_slip(_image_bytes: bytes) -> dict:
+    """ช่องเสียบ auto-verify ทีหลัง (เช่น SlipOK) — ตอนนี้คืน manual เสมอ"""
+    return {"auto": False, "reason": "manual-review"}
+
+
+@app.get("/internal/subscription/{guild_id}")
+async def internal_subscription(guild_id: str, x_bot_secret: str | None = Header(default=None)):
+    _check_bot_secret(x_bot_secret)
+    st = sub_status(guild_id)
+    # grace = ยังเล่นได้ (บอทนับ in_grace เป็นผ่าน)
+    return {"guild_id": guild_id, **st, "ok": st["paid"] or st["in_grace"]}
+
+
+@app.get("/billing/status/{guild_id}")
+async def billing_status(guild_id: str):
+    st = sub_status(guild_id)
+    return {"guild_id": guild_id, **st}
+
+
+@app.get("/billing/config")
+async def billing_config():
+    """ราคา+พร้อมเพย์ให้หน้า /pricing (ไม่ hardcode ลง repo frontend)"""
+    return {
+        "price": PLAN_PRICE,
+        "plan_days": PLAN_DAYS,
+        "grace_days": GRACE_DAYS,
+        "promptpay_id": PROMPTPAY_ID,
+    }
+
+
+@app.post("/billing/submit")
+async def billing_submit(guild_id: str, guild_name: str = "", slip: UploadFile = File(...)):
+    """ลูกค้าอัปโหลดสลิป — ตรวจมือ: เก็บไฟล์ + ลง pending ให้เจ้าของกดในดิส"""
+    if not guild_id.strip():
+        raise HTTPException(status_code=400, detail="guild_id required")
+    content = await slip.read()
+    if not content or len(content) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="invalid slip image")
+    pending_id = uuid.uuid4().hex[:12]
+    ext = (slip.filename or "").rsplit(".", 1)[-1].lower()[:4] or "png"
+    if ext not in ("png", "jpg", "jpeg", "webp"):
+        ext = "png"
+    path = os.path.join(SLIPS_DIR, f"{pending_id}.{ext}")
+    with open(path, "wb") as f:
+        f.write(content)
+    await verify_slip(content)  # ตอนนี้ manual เสมอ — อนาคตเสียบ SlipOK ตรงนี้
+    pending_slips[pending_id] = {
+        "pending_id": pending_id,
+        "guild_id": guild_id.strip(),
+        "guild_name": guild_name.strip(),
+        "filename": os.path.basename(path),
+        "status": "pending",
+        "created_at": time.strftime("%Y-%m-%d %H:%M"),
+        "notified": False,
+    }
+    return {"ok": True, "pending_id": pending_id, "status": "pending"}
+
+
+@app.get("/internal/pending")
+async def internal_pending(x_bot_secret: str | None = Header(default=None)):
+    _check_bot_secret(x_bot_secret)
+    return {"pending": [p for p in pending_slips.values() if p["status"] == "pending"]}
+
+
+@app.post("/internal/pending/{pending_id}/notified")
+async def internal_notified(pending_id: str, x_bot_secret: str | None = Header(default=None)):
+    _check_bot_secret(x_bot_secret)
+    if pending_id in pending_slips:
+        pending_slips[pending_id]["notified"] = True
+    return {"ok": True}
+
+
+@app.get("/internal/slip/{pending_id}")
+async def internal_slip(pending_id: str, x_bot_secret: str | None = Header(default=None)):
+    _check_bot_secret(x_bot_secret)
+    from fastapi.responses import FileResponse
+    p = pending_slips.get(pending_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="not found")
+    path = os.path.join(SLIPS_DIR, p["filename"])
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="file gone")
+    return FileResponse(path)
+
+
+@app.post("/internal/billing/approve")
+async def internal_approve(request: Request, x_bot_secret: str | None = Header(default=None)):
+    _check_bot_secret(x_bot_secret)
+    data = await request.json()
+    p = pending_slips.get(data.get("pending_id", ""))
+    if not p or p["status"] != "pending":
+        raise HTTPException(status_code=404, detail="pending not found")
+    new_until = extend_subscription(p["guild_id"])
+    p["status"] = "approved"
+    # ลบรูปสลิปหลังตรวจเสร็จ (ไม่เก็บข้อมูลลูกค้าไว้)
+    try:
+        os.remove(os.path.join(SLIPS_DIR, p["filename"]))
+    except OSError:
+        pass
+    return {"ok": True, "guild_id": p["guild_id"], "paid_until": new_until}
+
+
+@app.post("/internal/billing/reject")
+async def internal_reject(request: Request, x_bot_secret: str | None = Header(default=None)):
+    _check_bot_secret(x_bot_secret)
+    data = await request.json()
+    p = pending_slips.get(data.get("pending_id", ""))
+    if not p or p["status"] != "pending":
+        raise HTTPException(status_code=404, detail="pending not found")
+    p["status"] = "rejected"
+    try:
+        os.remove(os.path.join(SLIPS_DIR, p["filename"]))
+    except OSError:
+        pass
+    return {"ok": True}
 # ── Dashboard capability (หน้าเว็บถามว่าปุ่มแดงกดได้ไหม) ──────────────────
 @app.get("/capability/{guild_id}")
 async def capability(guild_id: str, key: str = ""):
     """key ถูก → can_control=true (ปุ่มแดงเปิด) / ไม่มี key → ดู+ขอเพลงได้อย่างเดียว"""
-    return {"guild_id": guild_id, "can_control": check_key(guild_id, key)}
+    st = sub_status(guild_id)
+    return {
+        "guild_id": guild_id,
+        "can_control": check_key(guild_id, key),
+        "sub_ok": st["paid"] or st["in_grace"],
+        "paid_until": st["paid_until"],
+    }
 
 
 # ── Internal (bot เรียกใช้ ต้องมี X-Bot-Secret) ────────────────────────────
