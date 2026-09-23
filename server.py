@@ -368,8 +368,27 @@ async def public_stats():
     """สถิติสาธารณะโชว์หน้า landing (นับเฉพาะดิสที่บอทเคยเห็น)"""
     guilds = len(state)
     playing = sum(1 for s in state.values() if s.get("is_playing"))
-    queued = sum(len(s.get("queue", [])) for s in state.values())
-    return {"guilds": guilds, "playing": playing, "queued": queued}
+    listeners = sum(int(s.get("listeners") or 0) for s in state.values())
+    pings = [s.get("ping_ms") for s in state.values() if isinstance(s.get("ping_ms"), (int, float))]
+    return {
+        "guilds": guilds,
+        "playing": playing,
+        "listeners": listeners,
+        "ping_ms": round(max(pings)) if pings else None,
+    }
+
+
+@app.get("/public/live")
+async def public_live(limit: int = 5):
+    """เพลงที่กำลังเล่นตอนนี้แบบนิรนาม — มีแค่ชื่อ+ปก ไม่มีชื่อดิส/คนขอ"""
+    live = []
+    for s in state.values():
+        song = s.get("now_playing")
+        if s.get("is_playing") and song:
+            live.append({"title": song.get("title", "?"), "thumbnail": song.get("thumbnail", "")})
+        if len(live) >= max(1, min(limit, 10)):
+            break
+    return {"live": live}
 
 
 @app.post("/billing/submit")
