@@ -213,7 +213,7 @@ async def remove_song(request: Request):
     return {"ok": True}
 
 
-# ── Billing: subscriptions (99฿/ดิส/30วัน) ─────────────────────────────────
+# ── Billing: subscriptions (49฿/ดิส/30วัน) ─────────────────────────────────
 # semi-manual: ลูกค้าส่งสลิป → ค้างใน pending → เจ้าของกด ✅/❌ ในดิส
 # ช่อง verify_slip() เตรียมไว้เสียบ SlipOK ทีหลัง (ตอนนี้ตรวจมือ 100%)
 SUBS_FILE = os.environ.get(
@@ -227,7 +227,7 @@ SLIPS_DIR = os.environ.get(
 PLAN_DAYS = int(os.environ.get("PLAN_DAYS", "30") or 30)
 GRACE_DAYS = int(os.environ.get("BILLING_GRACE_DAYS", "3") or 3)
 TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "30") or 0)  # 0 = ปิด trial ขายตรง
-PLAN_PRICE = float(os.environ.get("PLAN_PRICE", "99") or 99)
+PLAN_PRICE = float(os.environ.get("PLAN_PRICE", "49") or 49)
 PROMPTPAY_ID = os.environ.get("PROMPTPAY_ID", "")
 os.makedirs(SLIPS_DIR, exist_ok=True)
 
